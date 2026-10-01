@@ -1,14 +1,10 @@
+<script>
 (() => {
   "use strict";
 
-  const LEGACY_KEY = "premium-wheel-participants-v1";
-  const SESSIONS_KEY = "premium-wheel-sessions-v2";
   const ACTIVE_KEY = "premium-wheel-active-session-v2";
   const SOUND_KEY = "premium-wheel-sound-v1";
-  const DB_NAME = "premium-wheel-media-v1";
-  const STORE_NAME = "images";
   const TAU = Math.PI * 2;
-  const DEFAULT_NAMES = ["سارة", "محمد", "ليان", "خالد", "نورة", "عمر", "ريم", "يوسف"];
   const SESSION_TITLES = ["الجلسة الأولى", "الجلسة الثانية", "الجلسة الثالثة"];
   const PALETTE = [
     ["#6d5ce8", "#5142bd"], ["#2eb9ad", "#1e8d89"], ["#e1a73b", "#b97720"],
@@ -47,7 +43,7 @@
   const pendingImagePreview = $("#pendingImagePreview");
   const clearPendingImageButton = $("#clearPendingImage");
 
-  let sessions = loadSessions();
+  let sessions = emptySessions();
   let activeSessionIndex = loadActiveSession();
   let rotations = [0, 0, 0];
   let rotation = rotations[activeSessionIndex];
@@ -62,12 +58,14 @@
   let pendingImageUrl = null;
   let imageTargetIndex = null;
   let isProcessingImage = false;
+  let cloudReady = false;
+  let cloudWriteCount = 0;
+  let saveQueue = Promise.resolve();
   const imageCache = new Map();
   const imageLoads = new Map();
 
   let soundEnabled = true;
   try { soundEnabled = localStorage.getItem(SOUND_KEY) !== "off"; } catch { /* use default */ }
-  const imageDBPromise = openImageDB();
 
   function createId(prefix = "item") {
     const value = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -82,40 +80,6 @@
     return SESSION_TITLES.map((title, index) => ({ id: `session-${index + 1}`, title, items: [] }));
   }
 
-  function loadSessions() {
-    try {
-      const saved = localStorage.getItem(SESSIONS_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length === 3) {
-          return parsed.map((session, index) => ({
-            id: `session-${index + 1}`,
-            title: SESSION_TITLES[index],
-            items: Array.isArray(session.items) ? session.items
-              .filter((item) => item && (String(item.name || "").trim() || item.imageId))
-              .map((item) => ({
-                id: typeof item.id === "string" ? item.id : createId(),
-                name: String(item.name || "").trim().slice(0, 40),
-                imageId: typeof item.imageId === "string" ? item.imageId : null
-              })).slice(0, 120) : []
-          }));
-        }
-      }
-      const result = emptySessions();
-      const legacy = localStorage.getItem(LEGACY_KEY);
-      const names = legacy === null ? DEFAULT_NAMES : JSON.parse(legacy);
-      if (Array.isArray(names)) {
-        result[0].items = names.filter((name) => typeof name === "string" && name.trim()).map((name) => makeItem(name)).slice(0, 120);
-      }
-      localStorage.setItem(SESSIONS_KEY, JSON.stringify(result));
-      return result;
-    } catch {
-      const result = emptySessions();
-      result[0].items = DEFAULT_NAMES.map((name) => makeItem(name));
-      return result;
-    }
-  }
-
   function loadActiveSession() {
     try {
       const value = Number(localStorage.getItem(ACTIVE_KEY));
@@ -123,50 +87,77 @@
     } catch { return 0; }
   }
 
+  function serverCall(functionName, ...args) {
+    return new Promise((resolve, reject) => {
+      const runner = google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler((error) => reject(new Error(error?.message || "تعذر الاتصال بخدمة الحفظ.")));
+      runner[functionName](...args);
+    });
+  }
+
+  function normalizeCloudSessions(input) {
+    if (!Array.isArray(input) || input.length !== 3) return emptySessions();
+    return input.map((session, index) => ({
+      id: `session-${index + 1}`,
+      title: SESSION_TITLES[index],
+      items: Array.isArray(session?.items) ? session.items
+        .filter((item) => item && (String(item.name || "").trim() || item.imageId))
+        .map((item) => ({
+          id: typeof item.id === "string" && item.id ? item.id : createId(),
+          name: String(item.name || "").trim().slice(0, 40),
+          imageId: typeof item.imageId === "string" && item.imageId ? item.imageId : null
+        })).slice(0, 120) : []
+    }));
+  }
+
+  async function loadCloudData() {
+    try {
+      const result = await serverCall("getAppData");
+      sessions = normalizeCloudSessions(result?.sessions);
+      cloudReady = true;
+      renderAll();
+    } catch (error) {
+      showToast(error?.message || "تعذر تحميل البيانات المحفوظة.");
+      renderAll();
+    }
+  }
+
   function saveSessions() {
-    try { localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions)); }
-    catch { showToast("تعذر حفظ التغييرات على هذا الجهاز."); }
+    const snapshot = JSON.parse(JSON.stringify(sessions));
+    cloudWriteCount += 1;
+    renderAll();
+    const operation = saveQueue
+      .catch(() => undefined)
+      .then(() => serverCall("saveSessions", snapshot));
+    saveQueue = operation;
+    return operation.finally(() => {
+      cloudWriteCount = Math.max(0, cloudWriteCount - 1);
+      renderAll();
+    });
   }
 
   const activeItems = () => sessions[activeSessionIndex].items;
 
-  function openImageDB() {
+  function blobToBase64(blob) {
     return new Promise((resolve, reject) => {
-      if (!("indexedDB" in globalThis)) return reject(new Error("Image storage unavailable"));
-      const request = indexedDB.open(DB_NAME, 1);
-      request.onupgradeneeded = () => {
-        if (!request.result.objectStoreNames.contains(STORE_NAME)) {
-          request.result.createObjectStore(STORE_NAME, { keyPath: "id" });
-        }
-      };
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+      reader.onerror = () => reject(new Error("تعذر قراءة الصورة."));
+      reader.readAsDataURL(blob);
     });
   }
 
-  async function putImage(id, blob) {
-    const db = await imageDBPromise;
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, "readwrite");
-      tx.objectStore(STORE_NAME).put({ id, blob, updatedAt: Date.now() });
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error);
-    });
-  }
-
-  async function getImageBlob(id) {
-    const db = await imageDBPromise;
-    return new Promise((resolve, reject) => {
-      const request = db.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).get(id);
-      request.onsuccess = () => resolve(request.result?.blob || null);
-      request.onerror = () => reject(request.error);
-    });
+  async function putImage(blob) {
+    const base64 = await blobToBase64(blob);
+    const result = await serverCall("uploadImage", { base64, mimeType: blob.type });
+    if (!result?.id) throw new Error("لم تُرجع خدمة التخزين معرّفًا للصورة.");
+    return result.id;
   }
 
   function releaseCachedImage(id) {
     const cached = imageCache.get(id);
-    if (cached?.url) URL.revokeObjectURL(cached.url);
+    if (cached?.url?.startsWith("blob:")) URL.revokeObjectURL(cached.url);
     imageCache.delete(id);
     imageLoads.delete(id);
   }
@@ -174,28 +165,19 @@
   async function deleteImage(id) {
     if (!id) return;
     releaseCachedImage(id);
-    try {
-      const db = await imageDBPromise;
-      await new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, "readwrite");
-        tx.objectStore(STORE_NAME).delete(id);
-        tx.oncomplete = resolve;
-        tx.onerror = () => reject(tx.error);
-      });
-    } catch { /* stale media is harmless */ }
+    await serverCall("deleteImage", id);
   }
 
   function ensureImage(id) {
     if (!id) return null;
     if (imageCache.has(id)) return imageCache.get(id);
     if (imageLoads.has(id)) return null;
-    const task = getImageBlob(id).then((blob) => {
-      if (!blob) return null;
-      const url = URL.createObjectURL(blob);
+    const task = serverCall("getImageData", id).then((url) => {
+      if (!url) return null;
       return new Promise((resolve, reject) => {
         const image = new Image();
         image.onload = () => resolve({ image, url });
-        image.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Decode failed")); };
+        image.onerror = () => reject(new Error("Decode failed"));
         image.src = url;
       });
     }).then((entry) => {
@@ -442,12 +424,13 @@
       tab.classList.toggle("active", active);
       tab.setAttribute("aria-pressed", String(active));
       tab.querySelector("small").textContent = formatCount(sessions[index].items.length);
-      tab.disabled = isSpinning;
+      tab.disabled = isSpinning || !cloudReady || cloudWriteCount > 0;
     });
   }
 
   function renderParticipantList() {
     const items = activeItems();
+    const controlsDisabled = isSpinning || !cloudReady || cloudWriteCount > 0;
     if (!items.length) {
       participantList.innerHTML = '<div class="list-empty"><strong>الجلسة فارغة</strong><span>أضف اسمًا أو صورة من الأعلى.</span></div>';
       return;
@@ -461,10 +444,10 @@
         : `<span class="participant-item__number">${String(index + 1).padStart(2, "0")}</span>`;
       return `<div class="participant-item" role="listitem" style="--item-color:${color}">
         ${lead}<span class="participant-item__name" title="${label}">${label}</span>
-        <button class="participant-item__image" type="button" data-image-index="${index}" aria-label="${item.imageId ? "تغيير" : "إضافة"} صورة ${label}" ${isSpinning ? "disabled" : ""}>
+        <button class="participant-item__image" type="button" data-image-index="${index}" aria-label="${item.imageId ? "تغيير" : "إضافة"} صورة ${label}" ${controlsDisabled ? "disabled" : ""}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h4l1.5-2h5L16 8h4v11H4V8Z"/><circle cx="12" cy="13" r="3.5"/></svg>
         </button>
-        <button class="participant-item__delete" type="button" data-delete-index="${index}" aria-label="حذف ${label}" ${isSpinning ? "disabled" : ""}>
+        <button class="participant-item__delete" type="button" data-delete-index="${index}" aria-label="حذف ${label}" ${controlsDisabled ? "disabled" : ""}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6"/></svg>
         </button></div>`;
     }).join("");
@@ -472,12 +455,13 @@
 
   function renderAll() {
     const count = activeItems().length;
+    const controlsDisabled = !cloudReady || cloudWriteCount > 0;
     participantCount.textContent = String(count);
     listBadge.textContent = formatCount(count);
-    spinButton.disabled = isSpinning || !count;
-    spinHub.disabled = isSpinning || !count;
-    resetButton.disabled = isSpinning || !count;
-    imagePickerButton.disabled = isSpinning || isProcessingImage;
+    spinButton.disabled = controlsDisabled || isSpinning || !count;
+    spinHub.disabled = controlsDisabled || isSpinning || !count;
+    resetButton.disabled = controlsDisabled || isSpinning || !count;
+    imagePickerButton.disabled = controlsDisabled || isSpinning || isProcessingImage;
     soundToggle.setAttribute("aria-pressed", String(soundEnabled));
     soundToggle.setAttribute("aria-label", soundEnabled ? "إيقاف الصوت" : "تشغيل الصوت");
     renderSessionTabs();
@@ -519,27 +503,41 @@
     }
     let imageId = null;
     if (pendingImageBlob) {
-      imageId = createId("image");
-      try { await putImage(imageId, pendingImageBlob); }
-      catch { showFormMessage("تعذر حفظ الصورة. تأكد من توفر مساحة على الجهاز."); return; }
+      try { imageId = await putImage(pendingImageBlob); }
+      catch { showFormMessage("تعذر رفع الصورة إلى Google Drive."); return; }
     }
-    activeItems().push(makeItem(name, imageId));
-    saveSessions();
-    clearPendingImage();
-    nameInput.value = "";
-    renderAll();
-    showFormMessage(name ? `تمت إضافة ${name}.` : "تمت إضافة الصورة.", true);
-    nameInput.focus();
+    const item = makeItem(name, imageId);
+    activeItems().push(item);
+    try {
+      await saveSessions();
+      clearPendingImage();
+      nameInput.value = "";
+      renderAll();
+      showFormMessage(name ? `تمت إضافة ${name}.` : "تمت إضافة الصورة.", true);
+      nameInput.focus();
+    } catch (error) {
+      const index = activeItems().findIndex((entry) => entry.id === item.id);
+      if (index >= 0) activeItems().splice(index, 1);
+      if (imageId) deleteImage(imageId).catch(() => undefined);
+      renderAll();
+      showFormMessage(error?.message || "تعذر حفظ العنصر.");
+    }
   }
 
   async function removeItem(index, announce = true) {
     const items = activeItems();
-    if (isSpinning || index < 0 || index >= items.length) return;
+    if (!cloudReady || cloudWriteCount > 0 || isSpinning || index < 0 || index >= items.length) return;
     const [removed] = items.splice(index, 1);
-    saveSessions();
     renderAll();
-    await deleteImage(removed.imageId);
-    if (announce) showToast(`تم حذف ${displayName(removed, index)} من الجلسة.`);
+    try {
+      await saveSessions();
+      if (removed.imageId) await deleteImage(removed.imageId);
+      if (announce) showToast(`تم حذف ${displayName(removed, index)} من الجلسة.`);
+    } catch (error) {
+      items.splice(index, 0, removed);
+      renderAll();
+      showToast(error?.message || "تعذر حذف العنصر.");
+    }
   }
 
   async function handleImageSelection(file) {
@@ -560,11 +558,16 @@
         const item = activeItems()[imageTargetIndex];
         if (!item) throw new Error("لم يعد العنصر موجودًا.");
         const oldId = item.imageId;
-        const newId = createId("image");
-        await putImage(newId, blob);
+        const newId = await putImage(blob);
         item.imageId = newId;
-        saveSessions();
-        if (oldId) await deleteImage(oldId);
+        try {
+          await saveSessions();
+        } catch (error) {
+          item.imageId = oldId;
+          await deleteImage(newId).catch(() => undefined);
+          throw error;
+        }
+        if (oldId) await deleteImage(oldId).catch(() => undefined);
         ensureImage(newId);
         showToast(oldId ? "تم تحديث الصورة." : "تمت إضافة الصورة إلى العنصر.");
       }
@@ -579,7 +582,7 @@
   }
 
   function switchSession(index) {
-    if (isSpinning || index === activeSessionIndex || index < 0 || index > 2) return;
+    if (!cloudReady || cloudWriteCount > 0 || isSpinning || index === activeSessionIndex || index < 0 || index > 2) return;
     rotations[activeSessionIndex] = rotation;
     activeSessionIndex = index;
     rotation = rotations[index];
@@ -595,7 +598,7 @@
 
   function spin() {
     const items = activeItems();
-    if (isSpinning) return;
+    if (!cloudReady || cloudWriteCount > 0 || isSpinning) return;
     if (!items.length) { showToast("أضف اسمًا أو صورة قبل التدوير."); nameInput.focus(); return; }
     isSpinning = true;
     selectedIndex = randomInt(items.length);
@@ -734,9 +737,12 @@
     confettiFrame = requestAnimationFrame(animate);
   }
 
-  addForm.addEventListener("submit", (event) => { event.preventDefault(); if (!isSpinning) addItem(nameInput.value); });
+  addForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (cloudReady && cloudWriteCount === 0 && !isSpinning) addItem(nameInput.value);
+  });
   imagePickerButton.addEventListener("click", () => {
-    if (isSpinning || isProcessingImage) return;
+    if (!cloudReady || cloudWriteCount > 0 || isSpinning || isProcessingImage) return;
     imageTargetIndex = null; imageInput.value = ""; imageInput.click();
   });
   clearPendingImageButton.addEventListener("click", clearPendingImage);
@@ -745,7 +751,9 @@
     const remove = event.target.closest("[data-delete-index]");
     if (remove) { removeItem(Number(remove.dataset.deleteIndex)); return; }
     const picture = event.target.closest("[data-image-index]");
-    if (picture && !isSpinning) { imageTargetIndex = Number(picture.dataset.imageIndex); imageInput.value = ""; imageInput.click(); }
+    if (picture && cloudReady && cloudWriteCount === 0 && !isSpinning) {
+      imageTargetIndex = Number(picture.dataset.imageIndex); imageInput.value = ""; imageInput.click();
+    }
   });
   sessionTabs.forEach((tab) => tab.addEventListener("click", () => switchSession(Number(tab.dataset.session))));
   spinButton.addEventListener("click", spin);
@@ -753,13 +761,21 @@
 
   resetButton.addEventListener("click", async () => {
     const items = [...activeItems()];
-    if (!items.length || isSpinning) return;
+    if (!cloudReady || cloudWriteCount > 0 || !items.length || isSpinning) return;
     if (confirm(`هل تريد حذف جميع محتويات ${SESSION_TITLES[activeSessionIndex]}؟`)) {
       sessions[activeSessionIndex].items = [];
       rotation = rotations[activeSessionIndex] = 0;
-      saveSessions(); renderAll();
-      await Promise.all(items.map((item) => deleteImage(item.imageId)));
-      showToast("تمت إعادة ضبط الجلسة.");
+      renderAll();
+      try {
+        await saveSessions();
+        await serverCall("deleteImages", items.map((item) => item.imageId).filter(Boolean));
+        items.forEach((item) => releaseCachedImage(item.imageId));
+        showToast("تمت إعادة ضبط الجلسة.");
+      } catch (error) {
+        sessions[activeSessionIndex].items = items;
+        renderAll();
+        showToast(error?.message || "تعذرت إعادة ضبط الجلسة.");
+      }
     }
   });
 
@@ -786,11 +802,13 @@
   });
   addEventListener("beforeunload", () => {
     if (pendingImageUrl) URL.revokeObjectURL(pendingImageUrl);
-    imageCache.forEach((entry) => entry?.url && URL.revokeObjectURL(entry.url));
+    imageCache.forEach((entry) => entry?.url?.startsWith("blob:") && URL.revokeObjectURL(entry.url));
   });
   if ("ResizeObserver" in globalThis) new ResizeObserver(resizeCanvas).observe(canvas);
   else addEventListener("resize", resizeCanvas);
 
   renderAll();
   requestAnimationFrame(resizeCanvas);
+  loadCloudData();
 })();
+</script>
